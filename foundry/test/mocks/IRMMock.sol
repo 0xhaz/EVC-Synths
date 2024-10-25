@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: SEE LICENSE IN LICENSE
+pragma solidity ^0.8.19;
+
+import {IIRM} from "src/helpers/interfaces/IIRM.sol";
+
+contract IRMMock is IIRM {
+    uint256 internal constant SECONDS_PER_YEAR = 365.2425 * 86400; // Gregorian calendar year
+    uint96 internal constant MAX_ALLOWED_INTEREST_RATE = uint96(uint256(5 * 1e27) / SECONDS_PER_YEAR); // 500% APR
+    uint96 internal constant MIN_ALLOWED_INTEREST_RATE = 0;
+
+    uint256 internal interestRate;
+
+    function setInterestRate(
+        uint256 _interestRate
+    ) external {
+        interestRate = _interestRate;
+    }
+
+    function computeInterestRate(address market, address asset, uint32 utilization) external returns (uint96) {
+        uint96 rate = computeInterestRateImpl(market, asset, utilization);
+
+        if (rate > MAX_ALLOWED_INTEREST_RATE) {
+            rate = MAX_ALLOWED_INTEREST_RATE;
+        } else if (rate < MIN_ALLOWED_INTEREST_RATE) {
+            rate = MIN_ALLOWED_INTEREST_RATE;
+        }
+
+        return rate;
+    }
+
+    function computeInterestRateImpl(address, address, uint32) internal virtual returns (uint96) {
+        return uint96(uint256((1e27 * interestRate) / 100) / (86400 * 365)); // not SECONDS_PER_YEAR to avoid overflow
+    }
+
+    function reset(address market, bytes calldata resetParams) external virtual {}
+}
