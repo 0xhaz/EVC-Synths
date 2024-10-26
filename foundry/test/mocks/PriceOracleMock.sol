@@ -92,5 +92,14 @@ contract PriceOracleMock is IPriceOracle {
             amount = isVault ? IERC4626(base).convertToAssets(amount) : amount;
             return _resolveOracle(amount, underlying, quote);
         }
+
+        // Recursively resolve `quote`
+        (underlying, isVault) = _getAssetInfo(resolvedAssets[quote]);
+        if (underlying != address(0)) {
+            amount = isVault ? IERC4626(quote).convertToShares(amount) : amount;
+            return _resolveOracle(amount, base, underlying);
+        }
+
+        revert PO_NoPath();
     }
 }
