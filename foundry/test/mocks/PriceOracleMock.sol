@@ -86,7 +86,7 @@ contract PriceOracleMock is IPriceOracle {
         uint256 price = prices[base][quote];
         if (price > 0) return (amount, base, quote, price);
 
-        // Recursively resolve `base`
+        // Recursively resolve `base`.
         (address underlying, bool isVault) = _getAssetInfo(resolvedAssets[base]);
         if (underlying != address(0)) {
             amount = isVault ? IERC4626(base).convertToAssets(amount) : amount;
