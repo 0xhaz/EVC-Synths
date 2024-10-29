@@ -19,4 +19,19 @@ import {IBalancerPool} from "src/balancer-adapter/interfaces/IBalancerPool.sol";
 import {StablePoolUserData} from "src/balancer-adapter/interfaces/StablePoolUserData.sol";
 import {BalancerAdapter, IMinimalVault} from "src/balancer-adapter/BalancerAdapter.sol";
 import {WrappedRateProvider} from "src/balancer-adapter/WrappedRateProvider.sol";
-import 
+import {MockVault} from "test/mocks/MockVault.sol";
+
+contract BalancerAdapterTest is Test, BalancerSepoliaAddresses, ChainLinkFeedAddresses {
+    Fiat USDC;
+    Fiat eUSD;
+    Fiat DAI;
+
+    EthereumVaultConnector evc;
+    BalancerAdapter balancerAdapter;
+
+    ICSPFactory cspFactory;
+    IBalancerVaultGeneral balancerVault;
+    address userVault;
+    uint256 constant MAX_VAL = type(uint256).max;
+    address balancerPool;
+}
