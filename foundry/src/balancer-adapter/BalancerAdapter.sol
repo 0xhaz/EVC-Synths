@@ -192,7 +192,7 @@ contract BalancerAdapter is IPriceOracle, EVCUtil {
         // regular join and NO init
         IBalancerVaultGeneral(balancerVault).joinPool(
             poolId, // bytes32 poolId,
-            sender, // address sender,
+            address(this), // address sender,
             balancerPTRecipient, // address recipient,
             request // JoinPoolRequest memory request
         );
