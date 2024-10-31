@@ -5,7 +5,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 import {IIRM} from "src/helpers/interfaces/IIRM.sol";
 import {IPriceOracle} from "src/helpers/interfaces/IPriceOracle.sol";
-import {VaultSimple, Math, ERC20, IEVC, IERC20} from "src/helpers/open-zeppelin/VaultSimple.sol";
+import {VaultSimple, Math, ERC20, IEVC, IERC20, EVCClient} from "src/helpers/open-zeppelin/VaultSimple.sol";
 
 /**
  * @title VaultRegularBorrowable
@@ -289,6 +289,198 @@ contract VaultRegularBorrowable is VaultSimple {
     }
 
     /**
+     * @notice Disables the controller
+     * @dev The controller is only disabled if the account has no debt. If the account has outstanding debt, the
+     * function reverts
+     */
+    function disableController() external virtual override nonReentrant {
+        // ensure that the account does not have any liabilities before disabling the controller
+        address msgSender = _msgSender();
+        if (_debtOf(msgSender) == 0) {
+            EVCClient.disableController(msgSender);
+        } else {
+            revert OutstandingDebt();
+        }
+    }
+
+    /**
+     * @notice Borrows assets from the vault
+     * @param assets The amount of assets to borrow
+     * @param receiver The address that will receive the borrowed assets
+     */
+    function borrow(
+        uint256 assets,
+        address receiver
+    ) external virtual callThroughEVC nonReentrant onlyEVCAccountOwner {
+        address msgSender = _msgSenderForBorrow();
+
+        createVaultSnapshot();
+
+        require(assets != 0, "VaultSimple: Borrow amount must be greater than 0");
+
+        _increaseOwed(msgSender, assets);
+
+        emit Borrow(msgSender, receiver, assets);
+
+        SafeERC20.safeTransfer(IERC20(asset()), receiver, assets);
+
+        _totalAssets -= assets;
+
+        requireAccountAndVaultStatusCheck(msgSender);
+    }
+
+    /**
+     * @notice Repays assets to the vault
+     * @dev This function transfers the specified amount of assets from the caller to the vault
+     * @param assets The amount of assets to repay
+     * @param receiver The address that will receive the repaid assets
+     */
+    function repay(uint256 assets, address receiver) external virtual callThroughEVC nonReentrant {
+        address msgSender = _msgSender();
+
+        // sanity check: the receiver must ber under control of the EVC. Otherwise, we allowed to disable this vault as
+        // the controller for an account with debt
+        if (!isControllerEnabled(receiver, address(this))) {
+            revert ControllerDisabled();
+        }
+
+        createVaultSnapshot();
+
+        require(assets != 0, "VaultSimple: Repay amount must be greater than 0");
+
+        SafeERC20.safeTransferFrom(IERC20(asset()), msgSender, address(this), assets);
+
+        _totalAssets += assets;
+
+        _decreaseOwed(msgSender, assets);
+
+        emit Repay(msgSender, receiver, assets);
+
+        requireAccountAndVaultStatusCheck(address(0));
+    }
+
+    /**
+     * @notice Pulls debt from an account
+     * @dev This function decreases the debt of one account and increases the debt of another
+     * @dev Despite the lack of asset transfers, this function emits Repay and Borrow events
+     * @param from the account to pull the debt from
+     * @param assets The amount of debt to pull
+     * @return A boolean indicating whether the operation was successful
+     */
+    function pullDebt(address from, uint256 assets) external callThroughEVC nonReentrant returns (bool) {
+        address msgSender = _msgSenderForBorrow();
+
+        // sanity check: the account from which the debt is pulled must be under control of the EVC
+        // _msgSenderForBorrow checks that `msgSender` is controlled by this vault
+        if (!isControllerEnabled(from, address(this))) {
+            revert ControllerDisabled();
+        }
+
+        createVaultSnapshot();
+
+        require(assets != 0, "VaultSimple: Repay amount must be greater than 0");
+        require(msgSender != from, "VaultSimple: Cannot pull debt from the same account");
+
+        _decreaseOwed(from, assets);
+        _increaseOwed(msgSender, assets);
+
+        emit Repay(msgSender, from, assets);
+        emit Borrow(msgSender, msgSender, assets);
+
+        requireAccountAndVaultStatusCheck(msgSender);
+
+        return true;
+    }
+
+    /**
+     * @notice Liquidates an violator account
+     * @param violator The account to liquidate
+     * @param collateral The collateral to use for the liquidation
+     * @param repayAssets The amount of assets to repay
+     */
+    function liquidate(
+        address violator,
+        address collateral,
+        uint256 repayAssets
+    ) external callThroughEVC nonReentrant {
+        address msgSender = _msgSenderForBorrow();
+
+        if (msgSender == violator) {
+            revert SelfLiquidation();
+        }
+
+        if (repayAssets == 0) {
+            revert RepayAssetsInsufficient();
+        }
+
+        // due to later violator's account check forgiveness
+        // the violator's account must be fully settled when liquidating
+        if (isAccountStatusCheckDeferred(violator)) {
+            revert ViolatorStatusCheckDeferred();
+        }
+
+        // sanity check: the violator must be under control of the EVC
+        if (!isControllerEnabled(violator, address(this))) {
+            revert ControllerDisabled();
+        }
+
+        createVaultSnapshot();
+
+        uint256 seizeAssets = _calculateAssetsToSeize(violator, collateral, repayAssets);
+
+        _decreaseOwed(violator, repayAssets);
+        _increaseOwed(msgSender, repayAssets);
+
+        emit Repay(msgSender, violator, repayAssets);
+        emit Borrow(msgSender, msgSender, repayAssets);
+
+        if (collateral == address(this)) {
+            // if the liquidator tries to seize the assets from this vault
+            // we need to be sure that the violator has enabled this vault as a controller
+            if (!isControllerEnabled(violator, address(this))) {
+                revert CollateralDisabled();
+            }
+
+            _update(violator, msgSender, seizeAssets);
+        } else {
+            // if external assets are being seized, the EVC will take care of safety
+            // checks during the collateral control
+            liquidateCollateralShares(collateral, violator, msgSender, seizeAssets);
+
+            // there's a possibility that the liquidation does not bring the violator back to
+            // a healthy state or the liquidator chooses not to repay enough to bring the violator
+            // back to health. hence, the accoutn status check that is scheduled during the
+            // controlCollateral may fail reverting the liquidation. Hence, as a controller, we
+            // can forgive the account status check for the violator allowing it to end up in
+            // an unhealthy state after the liquidation.
+            // IMPORTANT: the account status check forgiveness must be done with care!
+            // a malicious collateral could do some funky stuff during the controlCollateral
+            // leading to withdrawal of more collateral than specified, or withdrawal of other
+            // collaterals, leaving us with bad debt. To prevent that, we ensure that only collaterals
+            // with cf > 0 can be seized which means that only vetted collaterals are seizable and
+            // cannot do any harm during the controlCollateral. The other option would be to snapshot
+            // the balances of all the collaterals before the controlCollateral and compare them  with
+            // expected balances after the controlCollateral. However, this is out of scope for this playground.
+            forgiveAccountStatusCheck(violator);
+        }
+
+        requireAccountAndVaultStatusCheck(msgSender);
+    }
+
+    /**
+     * @notice Retrieves the liability and collateral value of a given account
+     * @dev Account status is considered healthy if the collateral value is greater than or equal to the liability
+     * @param account The address of the account to retrieve the liability and collateral value
+     * @return liabilityValue The value of the liability
+     * @return collateralValue The value of the collateral
+     */
+    function getAccountLiabilityStatus(
+        address account
+    ) external view virtual returns (uint256 liabilityValue, uint256 collateralValue) {
+        (, liabilityValue, collateralValue) = _calculateLiabilityAndCollateral(account, getCollaterals(account), false);
+    }
+
+    /**
      * @notice Calculates the liability and collateral of an account
      * @param account The account to check
      * @param collaterals The collaterals of the account
@@ -328,6 +520,103 @@ contract VaultRegularBorrowable is VaultSimple {
                 }
             }
         }
+    }
+
+    /**
+     * @notice Calculates the amount of assets to seize from a violator account during a liquidation event
+     * @dev This function is used during the liquidation process to determine the amount of collateral to seize
+     * @param violator The address of the violator account
+     * @param collateral The address of the collateral asset
+     * @param repayAssets The amount of assets to repay
+     * @return The amount of assets to seize from the violator account
+     */
+    function _calculateAssetsToSeize(
+        address violator,
+        address collateral,
+        uint256 repayAssets
+    ) internal view returns (uint256) {
+        // do not allow to seize the assets for collateral without a collateral factor
+        // note that a user can enable any address as collateral, event if it's not recognized
+        // as such (cf == 0)
+        uint256 cf = collateralFactor[collateral];
+        if (cf == 0) {
+            revert CollateralDisabled();
+        }
+
+        (uint256 liabilityAssets, uint256 liabilityValue, uint256 collateralValue) =
+            _calculateLiabilityAndCollateral(violator, getCollaterals(violator), true);
+
+        // trying to repay more than the violator owes
+        if (repayAssets > liabilityAssets) {
+            revert RepayAssetsExceeded();
+        }
+
+        // check if violator's account is unhealthy
+        if (collateralValue >= liabilityValue) {
+            revert NoLiquidationOpportunity();
+        }
+
+        // calculate dynamic liquidation incentive
+        uint256 liquidationIncentive = 100 - (100 * collateralValue) / liabilityValue;
+
+        if (liquidationIncentive > MAX_LIQUIDATION_INCENTIVE) {
+            liquidationIncentive = MAX_LIQUIDATION_INCENTIVE;
+        }
+
+        // calculate the max repay value that will bring the violator back to target health factor
+        uint256 maxRepayValue = (TARGET_HEALTH_FACTOR * liabilityValue - 100 * collateralValue)
+            / (TARGET_HEALTH_FACTOR - (cf * (100 + liquidationIncentive)) / 100);
+
+        // get the desired value of repay assets
+        uint256 repayValue = IPriceOracle(oracle).getQuote(repayAssets, asset(), address(referenceAsset));
+
+        // check if the liquidator is not trying to repay too much
+        // this prevents the liquidator from liquidating entire position if not necessary
+        // if the at least half of the debt needs to be repaid to bring the account back to target health factor
+        // the liquidator can repay the entire debt
+        if (repayValue > maxRepayValue && maxRepayValue < liabilityValue / 2) {
+            revert RepayAssetsExceeded();
+        }
+
+        // the liquidator will be transferred the collateral value of the repaid debt + the liquidation incentive
+        uint256 seizeValue = (repayValue * (100 + liquidationIncentive)) / 100;
+        uint256 shareUnit = 10 ** ERC20(collateral).decimals();
+
+        uint256 seizeAssets =
+            (seizeValue * shareUnit) / IPriceOracle(oracle).getQuote(shareUnit, collateral, address(referenceAsset));
+
+        if (seizeAssets == 0) {
+            revert RepayAssetsInsufficient();
+        }
+
+        return seizeAssets;
+    }
+
+    /**
+     * @notice Increases the owed amount of an account
+     * @dev This function is overridden to snapshot the interest accumulator of the account
+     * @param account The account to increase the owed amount
+     * @param assets The amount of assets to increase
+     */
+    function _increaseOwed(address account, uint256 assets) internal virtual {
+        owed[account] = _debtOf(account) + assets;
+        _totalBorrowed += assets;
+        userInterestAccumulator[account] = interestAccumulator;
+    }
+
+    /**
+     * @notice Decreases the owed amount of an account
+     * @dev This function is overridden to snapshot the interest accumulator of the account
+     * @param account The account to decrease the owed amount
+     * @param assets The amount of assets to decrease
+     */
+    function _decreaseOwed(address account, uint256 assets) internal virtual {
+        owed[account] = _debtOf(account) - assets;
+
+        uint256 __totalBorrowed = _totalBorrowed;
+        _totalBorrowed = __totalBorrowed >= assets ? __totalBorrowed - assets : 0;
+
+        userInterestAccumulator[account] = interestAccumulator;
     }
 
     /**

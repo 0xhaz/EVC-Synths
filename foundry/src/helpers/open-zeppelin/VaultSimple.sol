@@ -87,7 +87,7 @@ contract VaultSimple is VaultBase, Ownable, ERC4626 {
      * @notice Checks the status of an account
      * @dev This function is called after any action that may affect the account's state
      */
-    function doCheckAccountStatus(address, address[] calldata) internal view override {
+    function doCheckAccountStatus(address, address[] calldata) internal view virtual override {
         // no-op
     }
 
